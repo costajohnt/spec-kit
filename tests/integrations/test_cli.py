@@ -1253,6 +1253,88 @@ class TestInitIntegrationFlag:
             "_register_extensions_for_agent was not called during init --here --force"
         )
 
+    def test_init_here_force_registers_extensions_in_skills_mode(self, tmp_path):
+        """Regression for #5321: init --here --force must persist this run's
+        init options before re-registering installed extensions. Registration
+        reads ``ai``/``ai_skills`` from init-options.json, so a skills-mode init
+        over a project with an installed extension but no init-options.json
+        used to write command-mode files for the extension instead of skills."""
+        from typer.testing import CliRunner
+
+        from specify_cli import app
+        from specify_cli.extensions import ExtensionManager
+
+        ext_id = "force-ext"
+        ext_src = tmp_path / ext_id
+        (ext_src / "commands").mkdir(parents=True)
+        (ext_src / "extension.yml").write_text(
+            yaml.safe_dump({
+                "schema_version": "1.0",
+                "extension": {
+                    "id": ext_id,
+                    "name": "Force Extension",
+                    "version": "1.0.0",
+                    "description": "Extension installed before init --force",
+                },
+                "requires": {"speckit_version": ">=0.1.0"},
+                "provides": {
+                    "commands": [
+                        {
+                            "name": f"speckit.{ext_id}.hello",
+                            "file": "commands/hello.md",
+                            "description": "Say hello",
+                        },
+                    ]
+                },
+            }),
+            encoding="utf-8",
+        )
+        (ext_src / "commands" / "hello.md").write_text(
+            "---\ndescription: \"Say hello\"\n---\n\n# Hello\n\nSay hello.\n",
+            encoding="utf-8",
+        )
+
+        # The issue's precondition: .specify/extensions/<id>/ is installed but
+        # no .specify/init-options.json exists yet.
+        project = tmp_path / "force-ext-skills"
+        (project / ".specify").mkdir(parents=True)
+        ExtensionManager(project).install_from_directory(
+            ext_src, "0.1.0", register_commands=False
+        )
+        assert (project / ".specify" / "extensions" / ext_id / "extension.yml").exists()
+        assert not (project / ".specify" / "init-options.json").exists()
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(project)
+            result = CliRunner().invoke(app, [
+                "init", "--here", "--force",
+                "--integration", "copilot",
+                "--integration-options", "--skills",
+                "--script", "sh",
+                "--ignore-agent-tools",
+            ], catch_exceptions=False)
+        finally:
+            os.chdir(old_cwd)
+
+        assert result.exit_code == 0, result.output
+        opts = json.loads(
+            (project / ".specify" / "init-options.json").read_text(encoding="utf-8")
+        )
+        assert opts["ai_skills"] is True
+
+        skill_file = (
+            project / ".github" / "skills" / f"speckit-{ext_id}-hello" / "SKILL.md"
+        )
+        assert skill_file.exists(), (
+            f"extension command was not registered as a skill; output:\n{result.output}"
+        )
+        command_file = project / ".github" / "prompts" / f"speckit.{ext_id}.hello.prompt.md"
+        assert not command_file.exists(), (
+            "skills-mode init --force wrote a command-mode file for the extension"
+        )
+        assert not (project / ".github" / "prompts").exists()
+
     def test_init_here_without_force_does_not_reapply_presets(self, tmp_path):
         """Without --force (fresh project), _register_presets_for_agent should NOT be called."""
         from unittest.mock import MagicMock, patch
